@@ -13,13 +13,6 @@ import (
 var templateFS embed.FS
 
 func main() {
-	// Validate configuration
-	if strings.Contains(config.APIURL, "CHANGEME") {
-		fmt.Fprintln(os.Stderr, "Error: you must configure your SmartSolve URLs in config.go before building.")
-		fmt.Fprintln(os.Stderr, "See README.md for setup instructions.")
-		os.Exit(1)
-	}
-
 	capaNum := flag.String("capa", "", "CAPA number (e.g., CAPA-2025-000054) (required)")
 	outputDir := flag.String("output", ".", "Directory to save the CAPA card Excel file")
 	token := flag.String("token", "", "JWT token (optional; bypasses reading from Chrome)")
@@ -71,7 +64,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error downloading CAPA: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.Remove(pdfPath)
+	// Keep the PDF alongside the card for reference
+	// It will be moved to the output directory after card generation
 
 	// Step 3: Extract fields from PDF
 	fmt.Println("Extracting CAPA data from PDF...")
@@ -87,43 +81,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Save non-layout actions (they have descriptions from pdftotext)
-	nonLayoutActions := make([]CAPAAction, len(capaData.Actions))
-	copy(nonLayoutActions, capaData.Actions)
-
-	// Re-parse actions from layout text (more reliable for titles and owners)
-	layoutText, layoutErr := extractLayoutTextFromPDF(pdfPath)
-	if layoutErr == nil && len(layoutText) > 0 {
-		parseCAPADetailFromLayout(layoutText, capaData)
-	}
-
-	// Merge descriptions from non-layout parser into layout parser results.
-	// The layout parser has better titles/owners but no descriptions.
-	// The non-layout parser has descriptions but weaker titles.
-	// Match by due date + action type, or by index if same count.
-	if len(capaData.Actions) == len(nonLayoutActions) {
-		for i := range capaData.Actions {
-			if capaData.Actions[i].Description == "" && nonLayoutActions[i].Description != "" {
-				capaData.Actions[i].Description = nonLayoutActions[i].Description
-			}
-			if capaData.Actions[i].Owner == "" && nonLayoutActions[i].Owner != "" {
-				capaData.Actions[i].Owner = nonLayoutActions[i].Owner
-			}
-		}
-	} else {
-		// Different counts; try matching by due date
-		for i := range capaData.Actions {
-			if capaData.Actions[i].Description != "" {
-				continue
-			}
-			for _, nla := range nonLayoutActions {
-				if nla.DueDate.Equal(capaData.Actions[i].DueDate) && nla.Description != "" &&
-					nla.ActionType == capaData.Actions[i].ActionType {
-					capaData.Actions[i].Description = nla.Description
-					break
-				}
-			}
-		}
+	// Validate that we extracted at least the CAPA number
+	if capaData.Number == "" {
+		fmt.Fprintln(os.Stderr, "Error: could not extract CAPA data from the PDF.")
+		fmt.Fprintln(os.Stderr, "The PDF may be corrupted, or the CAPA number may be incorrect.")
+		fmt.Fprintln(os.Stderr, "Verify the CAPA exists in SmartSolve and try again.")
+		os.Exit(1)
 	}
 
 	// Step 4: Generate the card
@@ -168,5 +131,11 @@ func main() {
 		fmt.Println("Status:  Investigation phase (front side only)")
 	}
 
+	// Move the PDF to the output directory for reference
+	pdfName := *capaNum + ".pdf"
+	pdfDest := filepath.Join(*outputDir, pdfName)
+	os.Rename(pdfPath, pdfDest)
+
 	fmt.Printf("\nSaved to: %s\n", cardPath)
+	fmt.Printf("PDF kept at: %s\n", pdfDest)
 }

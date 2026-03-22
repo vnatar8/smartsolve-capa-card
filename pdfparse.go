@@ -24,19 +24,42 @@ func isEffectivenessAction(actionType string) bool {
 	return strings.Contains(actionType, "Effectiveness")
 }
 
-// extractTextFromPDF extracts text from a PDF using pdftotext (preferred) or the Go PDF library.
+// extractTextFromPDF extracts text from a PDF using PyMuPDF (preferred), pdftotext, or Go PDF library.
+// PyMuPDF produces the most consistent output across different SmartSolve CAPA PDF structures.
 func extractTextFromPDF(pdfPath string) (string, error) {
-	// Try pdftotext first (handles SmartSolve PDFs with non-standard formatting).
-	if text, err := runPdftotext(pdfPath, false); err == nil && len(text) > 0 {
+	// Try PyMuPDF via Python first (most reliable for SmartSolve PDFs)
+	if text, err := runPyMuPDF(pdfPath); err == nil && len(text) > 100 {
 		return text, nil
 	}
-	// Fall back to the Go PDF library.
+	// Try pdftotext as fallback
+	if text, err := runPdftotext(pdfPath, false); err == nil && len(text) > 100 {
+		return text, nil
+	}
+	// Last resort: Go PDF library
 	return extractWithGoLibrary(pdfPath)
 }
 
-// extractLayoutTextFromPDF extracts text with layout preservation (column positions).
+// extractLayoutTextFromPDF extracts text with layout preservation (for owner detection).
 func extractLayoutTextFromPDF(pdfPath string) (string, error) {
 	return runPdftotext(pdfPath, true)
+}
+
+// runPyMuPDF shells out to Python with PyMuPDF (fitz) for text extraction.
+// This produces clean line-by-line output that is consistent across all CAPA PDF structures.
+func runPyMuPDF(pdfPath string) (string, error) {
+	script := `import sys, os, fitz
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+doc = fitz.open(sys.argv[1])
+for page in doc:
+    sys.stdout.write(page.get_text())
+doc.close()`
+	cmd := exec.Command("python", "-c", script, pdfPath)
+	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("PyMuPDF extraction failed: %w", err)
+	}
+	return string(out), nil
 }
 
 func runPdftotext(pdfPath string, layout bool) (string, error) {
@@ -606,16 +629,51 @@ func isRootCauseText(s string) bool {
 
 // parseActions parses actions from non-layout pdftotext output.
 // This works for both the spec format and basic pdftotext output.
+// parseActions parses actions from PyMuPDF text output.
+// PyMuPDF produces consistent line-by-line output where each action block follows:
+//
+//	Action Item Title          <- label
+//	Action Type                <- label
+//	<type>                     <- "Corrective"/"Preventive"/"Effectiveness..." (may have page noise before)
+//	<date>                     <- DD-Mon-YYYY (due date)
+//	<USERNAME>                 <- optional (completed by, for closed actions)
+//	<completed date>           <- optional
+//	<completed phase>          <- optional ("Implementation", "Planning")
+//	<Full Name>                <- optional (completed by full name)
+//	<title lines...>           <- action title (one or more lines)
+//	Action Plan                <- end of title section (or "Effectiveness Review Plan" for VOE)
+//	...
+//	<description lines>        <- between "Item No." and "Action Plan Description"
+//	Action Plan Description    <- end of description
+//	...
+//	<USERNAME>                 <- owner username
+//	<Full Name>                <- owner full name
+//	Assigned to User           <- label
 func parseActions(lines []string) (actions []CAPAAction, voeActions []CAPAAction) {
+	// Noise lines to skip (page breaks, headers, footers)
+	isNoise := func(s string) bool {
+		return s == "" ||
+			strings.HasPrefix(s, "Page ") ||
+			strings.HasPrefix(s, "Data is effective") ||
+			strings.HasPrefix(s, "Report is Generated") ||
+			strings.HasPrefix(s, "All Signature") ||
+			strings.HasPrefix(s, "All blank fields")
+	}
+
+	// Check if a line looks like a USERNAME (ALL.CAPS.WITH.DOT)
+	isUsername := func(s string) bool {
+		return len(s) > 3 && strings.Contains(s, ".") && s == strings.ToUpper(s)
+	}
+
 	for i := 0; i < len(lines); i++ {
 		if strings.TrimSpace(lines[i]) != "Action Item Title" {
 			continue
 		}
 
 		action := CAPAAction{}
-		searchEnd := min(i+100, len(lines))
 
-		// Find boundary: next "Action Item Title" or end of search range
+		// Find boundary: next "Action Item Title" or +100 lines
+		searchEnd := min(i+100, len(lines))
 		for j := i + 1; j < searchEnd; j++ {
 			if strings.TrimSpace(lines[j]) == "Action Item Title" {
 				searchEnd = j
@@ -623,70 +681,97 @@ func parseActions(lines []string) (actions []CAPAAction, voeActions []CAPAAction
 			}
 		}
 
-		// === Action Type ===
-		for j := i + 1; j < min(i+15, searchEnd); j++ {
-			val := strings.TrimSpace(lines[j])
-			if val == "Corrective" || val == "Preventive" || strings.Contains(val, "Effectiveness") {
-				action.ActionType = val
-				break
-			}
-		}
+		// === Scan forward from "Action Item Title", skipping noise ===
+		// Phase 1: Find action type and due date
+		// Phase 2: Skip completed-by info (USERNAME, date, phase, full name)
+		// Phase 3: Collect title lines until "Action Plan" or "Effectiveness Review Plan"
 
-		// === Due Date ===
-		for j := i + 1; j < searchEnd; j++ {
-			val := strings.TrimSpace(lines[j])
-			if m := datePattern.FindString(val); m != "" {
-				if d, err := parseDateString(m); err == nil {
-					action.DueDate = d
-					break
-				}
-			}
-		}
-
-		// === Title ===
+		phase := 1 // 1=looking for type/date, 2=skipping completed-by, 3=collecting title
 		var titleParts []string
+		foundType := false
 		foundDate := false
-		for j := i + 1; j < min(i+20, searchEnd); j++ {
-			val := strings.TrimSpace(lines[j])
+		titleDone := false
 
-			if !foundDate {
-				if datePattern.MatchString(val) {
-					foundDate = true
-				}
-				continue
-			}
-
-			if val == "Action Plan" || strings.HasPrefix(val, "Item No.") {
+		for j := i + 1; j < min(i+30, searchEnd); j++ {
+			if titleDone {
 				break
 			}
 
-			if val == "" || val == "Corrective" || val == "Preventive" || val == "Implementation" ||
-				val == "Action Type" || val == "Completed In" || val == "Completed By" ||
-				val == "Completed Date" || val == "Action Item Title" ||
-				strings.Contains(val, "Effectiveness") {
+			val := strings.TrimSpace(lines[j])
+
+			if isNoise(val) {
 				continue
 			}
 
-			if strings.Contains(val, ".") && val == strings.ToUpper(val) {
-				continue
+			if val == "Action Type" && !foundType {
+				continue // skip the label
 			}
 
-			if datePattern.MatchString(val) && len(val) == 11 {
-				continue
-			}
-
-			titleParts = append(titleParts, val)
-		}
-
-		if len(titleParts) == 0 {
-			for j := i + 1; j < min(i+20, searchEnd); j++ {
-				val := strings.TrimSpace(lines[j])
-				if val == "Action Plan" || strings.HasPrefix(val, "Item No.") {
-					break
+			if phase == 1 { // Looking for type and date
+				if !foundType {
+					if val == "Corrective" || val == "Preventive" || strings.Contains(val, "Effectiveness") {
+						action.ActionType = val
+						foundType = true
+						continue
+					}
 				}
-				if isActionTitleCandidate(val) {
-					titleParts = append(titleParts, val)
+				if foundType && !foundDate {
+					if d, err := parseDateString(val); err == nil {
+						action.DueDate = d
+						foundDate = true
+						phase = 2
+						continue
+					}
+					// For effectiveness actions, there may be no date before the title
+					if strings.Contains(action.ActionType, "Effectiveness") {
+						phase = 3
+						titleParts = append(titleParts, val)
+						continue
+					}
 				}
+				if !foundType {
+					if d, err := parseDateString(val); err == nil {
+						action.DueDate = d
+						foundDate = true
+						continue
+					}
+				}
+			} else if phase == 2 { // Skipping optional completed-by info
+				if isUsername(val) {
+					continue
+				}
+				if _, err := parseDateString(val); err == nil {
+					continue
+				}
+				if val == "Implementation" || val == "Planning" || val == "Investigation" ||
+					val == "Verification" {
+					continue
+				}
+				if looksLikePersonName(val) {
+					// Check if next non-noise line starts the title section
+					nextVal := ""
+					for k := j + 1; k < min(j+5, searchEnd); k++ {
+						nv := strings.TrimSpace(lines[k])
+						if !isNoise(nv) {
+							nextVal = nv
+							break
+						}
+					}
+					if nextVal == "Action Plan" || strings.Contains(nextVal, "Effectiveness") {
+						titleParts = append(titleParts, val)
+						phase = 3
+					}
+					// Otherwise it's the completed-by name, skip it
+					continue
+				}
+				phase = 3
+				titleParts = append(titleParts, val)
+			} else if phase == 3 { // Collecting title lines
+				if val == "Action Plan" || val == "Effectiveness Review Plan" {
+					titleDone = true
+					continue
+				}
+				titleParts = append(titleParts, val)
 			}
 		}
 
@@ -694,99 +779,71 @@ func parseActions(lines []string) (actions []CAPAAction, voeActions []CAPAAction
 			action.Title = cleanActionTitle(strings.Join(titleParts, " "))
 		}
 
-		// === Owner ===
-		// In pdftotext, "Assigned to User" is followed by USERNAME on the next
-		// non-noise line, then the full name. Page breaks can insert noise lines
-		// (Page X of Y, Data is effective, etc.) between these.
+		// === Description ===
+		// Lines between "Item No." and "Action Plan Description"
+		inDesc := false
+		var descParts []string
 		for j := i; j < searchEnd; j++ {
 			val := strings.TrimSpace(lines[j])
-			if val == "Assigned to User" || strings.HasPrefix(val, "Assigned to User") {
-				// Search forward up to 10 lines for USERNAME pattern, skipping noise
-				for k := j + 1; k < min(j+10, len(lines)); k++ {
+			if val == "Item No." {
+				inDesc = true
+				continue
+			}
+			if inDesc {
+				if val == "Action Plan Description" {
+					break
+				}
+				if isNoise(val) || val == "" {
+					continue
+				}
+				descParts = append(descParts, val)
+			}
+		}
+		if len(descParts) > 0 {
+			action.Description = strings.Join(descParts, " ")
+		}
+
+		// === Owner ===
+		// Find USERNAME followed by Full Name near "Assigned to User" or "Assigned to Role"
+		for j := i; j < searchEnd; j++ {
+			val := strings.TrimSpace(lines[j])
+			if val == "Assigned to Role" || val == "Assigned to User" {
+				// Search backwards for USERNAME + Full Name pair
+				for k := j - 1; k >= max(j-8, i); k-- {
 					candidate := strings.TrimSpace(lines[k])
-					// Skip page break noise
-					if candidate == "" || strings.HasPrefix(candidate, "Page ") ||
-						strings.HasPrefix(candidate, "Data is") ||
-						strings.HasPrefix(candidate, "Report is") ||
-						strings.HasPrefix(candidate, "All Signature") ||
-						strings.HasPrefix(candidate, "All blank") {
+					if isNoise(candidate) {
 						continue
 					}
-					// Check for USERNAME.PATTERN (all caps with dot)
-					if strings.Contains(candidate, ".") && candidate == strings.ToUpper(candidate) && len(candidate) > 3 {
+					if looksLikePersonName(candidate) {
+						action.Owner = candidate
+						break
+					}
+				}
+				if action.Owner != "" {
+					break
+				}
+				// Search forward as fallback
+				for k := j + 1; k < min(j+10, searchEnd); k++ {
+					candidate := strings.TrimSpace(lines[k])
+					if isNoise(candidate) {
+						continue
+					}
+					if isUsername(candidate) {
 						// Next non-noise line should be the full name
-						for m := k + 1; m < min(k+5, len(lines)); m++ {
+						for m := k + 1; m < min(k+5, searchEnd); m++ {
 							name := strings.TrimSpace(lines[m])
-							if name == "" || strings.HasPrefix(name, "Page ") ||
-								strings.HasPrefix(name, "Data is") ||
-								strings.HasPrefix(name, "All Signature") ||
-								strings.HasPrefix(name, "All blank") {
+							if isNoise(name) {
 								continue
 							}
 							if looksLikePersonName(name) {
 								action.Owner = name
-								break
-							}
-							// Also check combined on same line: "All Signature... Robert Cox"
-							if strings.Contains(name, "Robert") || strings.Contains(name, "Jeff") || strings.Contains(name, "Vignesh") {
-								// Extract just the person name part
-								for _, word := range strings.Fields(name) {
-									if word[0] >= 'A' && word[0] <= 'Z' && len(word) > 1 && word != "All" && word != "Signature" && word != "GMT" {
-										if action.Owner == "" {
-											action.Owner = word
-										} else {
-											action.Owner += " " + word
-										}
-									}
-								}
-								if action.Owner != "" {
-									break
-								}
 							}
 							break
 						}
 						break
-					}
-					// Also try USERNAME.FULLNAME pattern on same line
-					if mp := usernameFullNamePattern.FindStringSubmatch(candidate); len(mp) >= 3 {
-						action.Owner = mp[2]
-						break
-					}
-				}
-				// Also search backwards (some formats put name before label)
-				if action.Owner == "" {
-					for k := j - 1; k >= max(j-5, i); k-- {
-						candidate := strings.TrimSpace(lines[k])
-						if mp := usernameFullNamePattern.FindStringSubmatch(candidate); len(mp) >= 3 {
-							action.Owner = mp[2]
-							break
-						}
 					}
 				}
 				break
-			}
-		}
-
-		// === Description ===
-		// In pdftotext, the description is a standalone paragraph between the
-		// item number and "Verification/Validation Result". Look for the longest
-		// paragraph in the action block that isn't a title or label.
-		for j := i; j < searchEnd; j++ {
-			val := strings.TrimSpace(lines[j])
-			// Find long paragraphs (>80 chars) that are descriptions, not labels
-			if len(val) > 80 &&
-				!strings.HasPrefix(val, "All Signature") &&
-				!strings.HasPrefix(val, "Report is") &&
-				!strings.HasPrefix(val, "Data is") &&
-				!strings.HasPrefix(val, "Page ") &&
-				!strings.HasPrefix(val, "Verification/Validation") &&
-				!strings.HasPrefix(val, "Applicable Root Cause") &&
-				!strings.Contains(val, "Action Item Title") &&
-				!strings.Contains(val, "Action Type") {
-				// This is likely the action description
-				if action.Description == "" || len(val) > len(action.Description) {
-					action.Description = val
-				}
 			}
 		}
 
@@ -864,11 +921,13 @@ func parseInt(s string) int {
 func cleanActionTitle(title string) string {
 	// Fix common mid-word breaks from pdftotext column width
 	replacements := map[string]string{
-		"Devic e ":     "Device ",
-		"Devic e\n":    "Device\n",
-		" S\n":         "System\n",
-		"Overlay S":    "Overlay System",
-		"Containme nt": "Containment",
+		"Devic e ":      "Device ",
+		"Devic e\n":     "Device\n",
+		"Overlay S":     "Overlay System",
+		"Containme nt":  "Containment",
+		"Dist ribution": "Distribution",
+		"Pla nt":        "Plant",
+		"ribution Center)": "ribution Center)",
 	}
 	for old, new := range replacements {
 		title = strings.ReplaceAll(title, old, new)
